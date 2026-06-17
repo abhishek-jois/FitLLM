@@ -1,0 +1,97 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+*.pth
+site-packages/
+
+# ── Virtual Environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Model Shards & Large Binary Artifacts ────────────────────────────────────
+# Shard directories can be 10s of GB — never commit these.
+shards-*/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.gguf
+
+# ── Checkpoints ───────────────────────────────────────────────────────────────
+checkpoints-*/
+checkpoints/
+*.ckpt
+
+# ── Training Logs ─────────────────────────────────────────────────────────────
+training_*.log
+training_diag_*.log
+training_run.log
+training_dolly_*.log
+
+# ── Dataset Cache (HuggingFace datasets caches locally) ──────────────────────
+*.arrow
+*.cache
+~/.cache/huggingface/
+
+# ── Environment / Secrets ─────────────────────────────────────────────────────
+# .env contains real values — commit only .env.example
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ── IDE & Editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Testing & Coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.coveragerc
+.tox/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── LaTeX Build Artifacts ─────────────────────────────────────────────────────
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/*.bbl
+paper/*.blg
+
+# ── Tool Caches ───────────────────────────────────────────────────────────────
+.depgraph/cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── WandB ─────────────────────────────────────────────────────────────────────
+wandb/
+
+# ── Profiling ─────────────────────────────────────────────────────────────────
+*.prof
+*.lprof
+*.pyc.prof

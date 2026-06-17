@@ -1,0 +1,12 @@
+# Optional acceleration libraries for FitLLM
+# Install AFTER core requirements:
+#   uv pip install -r requirements-acceleration.txt --no-build-isolation
+
+# FlashAttention-2 (requires CUDA, compiles from source — can take 10-20 min)
+flash-attn>=2.5.0
+
+# Liger fused kernels (RMSNorm, RoPE, SwiGLU replacements)
+liger-kernel>=0.3.0
+
+# xFormers memory-efficient attention (alternative to flash-attn)
+xformers>=0.0.26

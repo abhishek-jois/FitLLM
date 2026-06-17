@@ -1,0 +1,24 @@
+# Core dependencies for FitLLM
+# Install with: uv pip install -r requirements.txt
+
+# PyTorch with CUDA 12.1 — installed via separate index (see setup instructions)
+# torch>=2.3.0 is listed here for reference; install it first via:
+#   uv pip install torch==2.3.0 torchvision --index-url https://download.pytorch.org/whl/cu121
+
+torch>=2.3.0
+torchvision
+
+# HuggingFace stack
+transformers>=4.40.0
+datasets>=2.18.0
+accelerate>=0.30.0
+peft>=0.10.0
+
+# Weights & serialisation
+safetensors>=0.4.3
+bitsandbytes>=0.43.0
+
+# Utilities
+psutil>=5.9.0
+tqdm>=4.66.0
+wandb>=0.16.0
