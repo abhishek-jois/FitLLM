@@ -73,6 +73,9 @@ coverage.xml
 .ipynb_checkpoints/
 *.ipynb
 
+# ── Patent & Internal Docs ────────────────────────────────────────────────────
+patent/
+
 # ── LaTeX Build Artifacts ─────────────────────────────────────────────────────
 paper/*.aux
 paper/*.log
@@ -84,7 +87,7 @@ paper/*.bbl
 paper/*.blg
 
 # ── Tool Caches ───────────────────────────────────────────────────────────────
-.depgraph/cache/
+.depgraph/
 .mypy_cache/
 .ruff_cache/
 
