@@ -76,15 +76,8 @@ coverage.xml
 # ── Patent & Internal Docs ────────────────────────────────────────────────────
 patent/
 
-# ── LaTeX Build Artifacts ─────────────────────────────────────────────────────
-paper/*.aux
-paper/*.log
-paper/*.out
-paper/*.fls
-paper/*.fdb_latexmk
-paper/*.synctex.gz
-paper/*.bbl
-paper/*.blg
+# ── Paper (LaTeX source, figures, PDFs, build artifacts) ──────────────────────
+paper/
 
 # ── Tool Caches ───────────────────────────────────────────────────────────────
 .depgraph/
