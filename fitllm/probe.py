@@ -40,11 +40,47 @@ class AdaptiveShardProbe:
         self._cached_result: Dict | None = None
         self._cached_effective_n: int = 1
 
+        # VRAM reserved by permanent GPU residents (lm_head + embed_tokens).
+        # For Qwen2.5-32B: vocab_size=152064, hidden=5120 → ~3 GB in fp16.
+        # These are NOT shard allocations, so we subtract them from our own
+        # reserved count when computing headroom — otherwise lm_head+embed
+        # exhaust the 4 GB budget before any shard can load.
+        # Set by ShardedModel.from_pretrained() after moving lm_head/embed to GPU.
+        self.baseline_reserved_gb: float = 0.0
+        self._last_logged_alloc_gb: float = -1.0  # throttle diagnostic prints
+
+    def update_baseline(self) -> None:
+        """Re-snapshot baseline to current memory_allocated().
+
+        Call this just before the shard layer loop starts (after embedding all
+        batches and computing position_embeddings) so that h_all, pos_emb, and
+        any other non-shard GPU residents are included in the baseline and don't
+        eat into the 4 GB shard budget.
+        """
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.synchronize()
+        current_alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+        if current_alloc_gb > self.baseline_reserved_gb + 0.01:
+            import logging as _log
+            _log.getLogger(__name__).info(
+                f"Baseline updated: {self.baseline_reserved_gb:.3f}GB → {current_alloc_gb:.3f}GB "
+                f"(+{current_alloc_gb - self.baseline_reserved_gb:.3f}GB absorbed; "
+                f"h_all/pos_emb/other non-shard residents)"
+            )
+            self.baseline_reserved_gb = current_alloc_gb
+
     def free_vram_gb(self) -> float:
         """Return free VRAM in GB, capped by FitLLM's own vram_limit_gb budget
         (if set). Supports CUDA, MPS, and CPU-only."""
         if torch.cuda.is_available():
             try:
+                # Release our own cached-but-unused allocator blocks before querying
+                # system free. Without this, our ~3 GB of allocator cache shows up
+                # as "used" in mem_get_info(), making the GPU appear full even though
+                # we're not actively using those blocks. Especially important on shared
+                # GPUs where every MB counts against other tenants.
+                torch.cuda.empty_cache()
                 free_bytes, _ = torch.cuda.mem_get_info()
             except RuntimeError:
                 # The GPU can be so saturated by other tenants that even this
@@ -53,8 +89,22 @@ class AdaptiveShardProbe:
                 return 0.0
             free_gb = free_bytes / (1024 ** 3)
             if self.vram_limit_gb > 0:
-                our_reserved_gb = torch.cuda.memory_reserved() / (1024 ** 3)
-                budget_remaining_gb = max(0.0, self.vram_limit_gb - our_reserved_gb)
+                # Use memory_allocated() (actual tensors in use) not memory_reserved()
+                # (which includes PyTorch's allocator cache blocks that inflate the
+                # count by 2-4 GB even when nothing new is allocated).
+                # Subtract baseline (lm_head + embed_tokens) so those permanent
+                # GPU residents don't eat into the shard loading budget.
+                our_alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+                shard_alloc_gb = max(0.0, our_alloc_gb - self.baseline_reserved_gb)
+                budget_remaining_gb = max(0.0, self.vram_limit_gb - shard_alloc_gb)
+                if abs(our_alloc_gb - self._last_logged_alloc_gb) > 0.01:
+                    import logging as _log
+                    _log.getLogger(__name__).info(
+                        f"VRAM probe: sys_free={free_gb:.3f}GB our_alloc={our_alloc_gb:.3f}GB "
+                        f"baseline={self.baseline_reserved_gb:.3f}GB shard_alloc={shard_alloc_gb:.3f}GB "
+                        f"budget_rem={budget_remaining_gb:.3f}GB → returning {min(free_gb,budget_remaining_gb):.3f}GB"
+                    )
+                    self._last_logged_alloc_gb = our_alloc_gb
                 return min(free_gb, budget_remaining_gb)
             return free_gb
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():

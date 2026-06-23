@@ -33,11 +33,13 @@ checkpoints-*/
 checkpoints/
 *.ckpt
 
-# ── Training Logs ─────────────────────────────────────────────────────────────
+# ── Training Logs & Run Notes ─────────────────────────────────────────────────
 training_*.log
 training_diag_*.log
 training_run.log
 training_dolly_*.log
+logs/
+TRAINING_RUNS.md
 
 # ── Dataset Cache (HuggingFace datasets caches locally) ──────────────────────
 *.arrow

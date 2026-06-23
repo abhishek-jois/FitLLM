@@ -215,7 +215,7 @@ class ShardedModel:
                     load_in_4bit=True,
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
                 )
                 logger.info("Using NF4 double-quantization via bitsandbytes")
             except (ImportError, Exception) as e:
@@ -243,8 +243,9 @@ class ShardedModel:
             # CPU-only load — safe with bitsandbytes, stays within 16 GB RAM budget
             load_kwargs: Dict = {
                 "device_map": "cpu",
-                "torch_dtype": torch.float16,
+                "torch_dtype": torch.bfloat16,
                 "low_cpu_mem_usage": True,
+                "attn_implementation": "flash_attention_2",
             }
             logger.info("Shards exist — loading model to CPU only (VRAM untouched) ...")
         else:
@@ -252,8 +253,9 @@ class ShardedModel:
             vram_limit_gb = float(os.environ.get("FITLLM_VRAM_LIMIT_GB", "4.0"))
             load_kwargs = {
                 "device_map": "auto",
-                "torch_dtype": torch.float16,
+                "torch_dtype": torch.bfloat16,
                 "low_cpu_mem_usage": True,
+                "attn_implementation": "flash_attention_2",
             }
             logger.info(f"No shards found — loading model for initial sharding (VRAM cap: {vram_limit_gb:.0f} GB) ...")
 
@@ -346,6 +348,28 @@ class ShardedModel:
         lm_head = lm_head.to(device) if device != "cpu" and torch.cuda.is_available() else lm_head
         embed_tokens = embed_tokens.to(device) if device != "cpu" and torch.cuda.is_available() else embed_tokens
 
+        # Extract the final layer norm that sits between the last decoder layer
+        # and lm_head (e.g. model.norm in Qwen2/Llama).  Without this, the
+        # hidden states entering lm_head are un-normalized (~30 per element
+        # instead of ~1), producing logits of ±600 instead of ±10-50 and
+        # making loss orders of magnitude too high.
+        _inner = getattr(_base, "model", _base)
+        final_norm = getattr(_inner, "norm", None)
+        if final_norm is not None:
+            final_norm = final_norm.to(device) if device != "cpu" and torch.cuda.is_available() else final_norm
+            logger.info(f"Final norm ({type(final_norm).__name__}) moved to {device}")
+        else:
+            logger.warning("Final norm not found on inner model — logits may be unnormalized")
+
+        # Snapshot actual tensor allocations for lm_head + embed_tokens + final_norm
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            baseline_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+            logger.info(f"Baseline VRAM (lm_head + embed_tokens + final_norm): {baseline_gb:.2f} GB")
+        else:
+            baseline_gb = 0.0
+        probe.baseline_reserved_gb = baseline_gb
+
         grad_dir = shard_dir / "grads"
 
         forward_engine = ForwardEngine(
@@ -357,6 +381,7 @@ class ShardedModel:
             use_fused_kernels=True,
             layer_skip_threshold=0.0,
             mixed_precision=shard_config.mixed_precision,
+            final_norm=final_norm,
         )
 
         backward_engine = BackwardEngine(
@@ -364,9 +389,10 @@ class ShardedModel:
             scheduler=scheduler,
             probe=probe,
             lm_head=lm_head,
-            loss_fn=nn.CrossEntropyLoss(),
+            loss_fn=nn.CrossEntropyLoss(ignore_index=-100),
             grad_dir=grad_dir,
             grad_accum_steps=training_config.grad_accum,
+            final_norm=final_norm,
         )
 
         optimizer = ShardOptimizer(

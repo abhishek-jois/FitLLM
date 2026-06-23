@@ -490,13 +490,20 @@ class LoRATrainer:
 
                 # Loss for logging (no grad needed here — backward handles grads)
                 accum_loss = 0.0
-                for _lg, _lb in zip(_logits_all, _batch_labels):
+                for bi, (_lg, _lb) in enumerate(zip(_logits_all, _batch_labels)):
                     _b, _s, _v = _lg.shape
-                    accum_loss += F.cross_entropy(
-                        _lg.float().view(_b * _s, _v),
-                        _lb.view(_b * _s),
-                        ignore_index=-100,
-                    ).item()
+                    _flat_lb = _lb.view(_b * _s)
+                    _flat_lg = _lg.float().view(_b * _s, _v)
+                    _ce = F.cross_entropy(_flat_lg, _flat_lb, ignore_index=-100).item()
+                    accum_loss += _ce
+                    if global_step == 0 and bi == 0:
+                        _n_unmasked = (_flat_lb != -100).sum().item()
+                        logger.info(
+                            f"[LOSS-DIAG] step=0 batch=0 ce={_ce:.4f} "
+                            f"n_unmasked={_n_unmasked}/{_b*_s} "
+                            f"label_dtype={_flat_lb.dtype} "
+                            f"logit_max={_flat_lg.max():.2f} logit_min={_flat_lg.min():.2f}"
+                        )
                 avg_loss = accum_loss / config.grad_accum
 
                 # Backward: shard 63→0, each loaded once, all batches backpropped.

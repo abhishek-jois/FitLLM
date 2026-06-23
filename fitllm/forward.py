@@ -19,6 +19,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _restore_bnb_quant_state(layer: nn.Module, tensors: dict) -> None:
+    """Rebuild NF4 QuantState for every Params4bit in the layer after load_state_dict.
+
+    load_state_dict only copies the raw 4-bit bytes (uint8); it ignores the
+    companion tensors like 'weight.absmax', 'weight.nested_quant_map', etc. that
+    are stored as flat keys in the shard dict.  Without the QuantState the
+    bitsandbytes dequantization uses wrong scale factors, producing wildly
+    out-of-range hidden states and logits (observed: logit range [-406, 512]
+    instead of the normal [-10, 10]).
+
+    This function reconstructs the QuantState from those companion tensors and
+    attaches it to each Params4bit parameter so that dequantization is correct.
+    """
+    try:
+        from bitsandbytes.nn import Params4bit
+        from bitsandbytes.functional import QuantState
+    except ImportError:
+        return
+
+    for param_name, param in layer.named_parameters():
+        if not isinstance(param, Params4bit):
+            continue
+        prefix = param_name + "."
+        qs_dict = {
+            k[len(prefix):]: v
+            for k, v in tensors.items()
+            if k.startswith(prefix)
+        }
+        if not qs_dict:
+            continue
+        try:
+            param.quant_state = QuantState.from_dict(qs_dict, device=param.device)
+        except Exception as e:
+            logger.debug(f"Could not restore quant_state for {param_name}: {e}")
+
+
 class _FunctionalRMSNorm(nn.Module):
     """CPU-safe RMSNorm used to replace LigerRMSNorm when compute_device is CPU."""
 
@@ -74,7 +110,7 @@ def _resolve_compute_device(
     scheduler: ShardScheduler,
     shard_size_gb: float,
     gpu_device: torch.device,
-    max_wait_seconds: float = 120.0,
+    max_wait_seconds: float = 600.0,
 ) -> torch.device:
     """Pick where to run this layer's compute, waiting out transient VRAM
     contention rather than immediately falling back to CPU.
@@ -151,12 +187,14 @@ class ForwardEngine:
         use_fused_kernels: bool = True,
         layer_skip_threshold: float = 0.0,
         mixed_precision: bool = True,
+        final_norm: Optional[nn.Module] = None,
     ) -> None:
         self.model_ref = model_ref
         self.scheduler = scheduler
         self.probe = probe
         self.lm_head = lm_head
         self.embed_tokens = embed_tokens
+        self.final_norm = final_norm
         self.use_fused_kernels = use_fused_kernels
         self.mixed_precision = mixed_precision and torch.cuda.is_available()
         self._amp_dtype = (
@@ -367,6 +405,23 @@ class ForwardEngine:
             [h.detach().cpu()] for h in h_all
         ]
 
+        # ── Sync baseline to capture h_all + pos_emb before shard budget checks ─
+        # embed_tokens outputs (h_all) and position_embeddings are non-shard
+        # GPU residents that weren't present when baseline_reserved_gb was
+        # first measured. Update it now so they don't consume shard budget.
+        self.probe.update_baseline()
+
+        # ── Diagnostic: show GPU state before layer loop (logged once per forward) ─
+        if torch.cuda.is_available():
+            _a = torch.cuda.memory_allocated() / 1024**3
+            _r = torch.cuda.memory_reserved() / 1024**3
+            _f, _ = torch.cuda.mem_get_info()
+            logger.info(
+                f"[DIAG] pre-layer-loop: alloc={_a:.3f}GB reserved={_r:.3f}GB "
+                f"sys_free={_f/1024**3:.3f}GB h_all_dtype={h_all[0].dtype} "
+                f"h_shape={list(h_all[0].shape)} n_batches={len(h_all)}"
+            )
+
         # ── Layer-outer loop: load each shard ONCE, run all batches through it ─
         for layer_idx in range(num_layers):
             # Re-check VRAM per layer — this GPU is shared with other tenants
@@ -407,6 +462,12 @@ class ForwardEngine:
                 # Save activation to CPU for backward pass
                 activations_all[batch_idx].append(h_out.detach().cpu())
 
+            # Move layer back to CPU before evicting GPU cache.
+            # _reconstruct_layer_module returns a reference to the actual
+            # hf_model decoder layer (not a copy), so del layer alone only
+            # drops the local ref — the hf_model still holds the object and
+            # its GPU tensors would remain, accumulating ~0.23 GB per layer.
+            layer.cpu()
             # Evict from GPU cache — frees VRAM for next layer load.
             # CPU weight cache keeps the shard for the backward phase.
             self.scheduler.evict_layer_from_gpu(layer_idx)
@@ -417,7 +478,10 @@ class ForwardEngine:
         logits_all: List[torch.Tensor] = []
         for h in h_all:
             with torch.no_grad(), _amp_ctx:
-                logits = self.lm_head(h.to(lm_head_device))
+                h_dev = h.to(lm_head_device)
+                if self.final_norm is not None:
+                    h_dev = self.final_norm(h_dev)
+                logits = self.lm_head(h_dev)
             logits_all.append(logits.detach().cpu())
 
         return logits_all, activations_all
@@ -615,6 +679,7 @@ class ForwardEngine:
             missing, _ = layer.load_state_dict(tensors, strict=False)
             if missing:
                 logger.debug(f"Layer {layer_idx}: {len(missing)} missing keys in shard")
+            _restore_bnb_quant_state(layer, tensors)
             return layer
 
         # Fallback: traverse HF model tree
@@ -628,6 +693,7 @@ class ForwardEngine:
             if layers is not None and layer_idx < len(layers):
                 layer = layers[layer_idx]
                 layer.load_state_dict(tensors, strict=False)
+                _restore_bnb_quant_state(layer, tensors)
                 return layer
 
         raise RuntimeError(

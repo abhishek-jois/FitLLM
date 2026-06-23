@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from .probe import AdaptiveShardProbe
 from .scheduler import ShardScheduler
-from .forward import _get_decoder_layers
+from .forward import _get_decoder_layers, _restore_bnb_quant_state
 
 if TYPE_CHECKING:
     from .model import ShardedModel
@@ -35,11 +35,13 @@ class BackwardEngine:
         loss_fn: Optional[nn.Module],
         grad_dir: Path,
         grad_accum_steps: int = 8,
+        final_norm: Optional[nn.Module] = None,
     ) -> None:
         self.model_ref = model_ref
         self.scheduler = scheduler
         self.probe = probe
         self.lm_head = lm_head
+        self.final_norm = final_norm
         self.loss_fn = loss_fn if loss_fn is not None else nn.CrossEntropyLoss()
         self.grad_dir = Path(grad_dir)
         self.grad_dir.mkdir(parents=True, exist_ok=True)
@@ -77,8 +79,9 @@ class BackwardEngine:
         lm_head_device = next(self.lm_head.parameters()).device
         h_last = activations[-1].to(lm_head_device).detach().requires_grad_(True)
 
-        # Re-run lm_head to get a fresh computation graph for the final loss
-        logits = self.lm_head(h_last)
+        # Re-run lm_head (with final norm) to get a fresh computation graph
+        h_for_head = self.final_norm(h_last) if self.final_norm is not None else h_last
+        logits = self.lm_head(h_for_head)
 
         if labels is not None:
             b, s, v = logits.shape
@@ -113,6 +116,7 @@ class BackwardEngine:
                         output = layer(h_prev)
                     except Exception as e:
                         logger.warning(f"Layer {layer_idx} forward failed in backward: {e}")
+                        layer.cpu()
                         self.scheduler.evict_layer_from_gpu(layer_idx)
                         del layer
                         continue
@@ -134,6 +138,10 @@ class BackwardEngine:
             # Accumulate LoRA grads in CPU RAM — no disk write
             self._accumulate_grads_to_ram(layer_idx, layer)
 
+            # Move layer back to CPU — _reconstruct_layer returns a ref to the
+            # actual hf_model decoder layer (not a copy), so del alone doesn't
+            # free GPU VRAM (hf_model keeps the reference alive).
+            layer.cpu()
             # Done with this layer's GPU copy — free VRAM for next layer
             self.scheduler.evict_layer_from_gpu(layer_idx)
             del layer
@@ -180,7 +188,8 @@ class BackwardEngine:
         for batch_idx in range(num_batches):
             h_last = (activations_all[batch_idx][-1]
                       .to(lm_head_device).detach().requires_grad_(True))
-            logits = self.lm_head(h_last)
+            h_for_head = self.final_norm(h_last) if self.final_norm is not None else h_last
+            logits = self.lm_head(h_for_head)
             b, s, v = logits.shape
             labels = labels_all[batch_idx].to(lm_head_device)
             loss = self.loss_fn(logits.view(b * s, v), labels.view(b * s))
@@ -232,6 +241,9 @@ class BackwardEngine:
                 # Accumulate this batch's LoRA grads into the per-layer RAM bucket
                 self._accumulate_grads_to_ram(layer_idx, layer)
 
+            # Move layer back to CPU before evicting (same reason as in forward:
+            # _reconstruct_layer returns a hf_model ref, del alone doesn't free GPU).
+            layer.cpu()
             # Free GPU memory — CPU weight cache keeps shard until clear_weight_cache()
             self.scheduler.evict_layer_from_gpu(layer_idx)
             del layer
@@ -247,6 +259,7 @@ class BackwardEngine:
         if cached_layers is not None and layer_idx < len(cached_layers):
             layer = cached_layers[layer_idx]
             layer.load_state_dict(tensors, strict=False)
+            _restore_bnb_quant_state(layer, tensors)
             return layer
 
         # Fallback: traverse HF model tree
@@ -261,6 +274,7 @@ class BackwardEngine:
             raise RuntimeError(f"Cannot find layer {layer_idx}")
         layer = layers[layer_idx]
         layer.load_state_dict(tensors, strict=False)
+        _restore_bnb_quant_state(layer, tensors)
         return layer
 
     def _accumulate_grads_to_ram(self, layer_idx: int, layer: nn.Module) -> None:
