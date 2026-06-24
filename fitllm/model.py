@@ -215,7 +215,7 @@ class ShardedModel:
                     load_in_4bit=True,
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_compute_dtype=torch.float16,
                 )
                 logger.info("Using NF4 double-quantization via bitsandbytes")
             except (ImportError, Exception) as e:
@@ -243,7 +243,7 @@ class ShardedModel:
             # CPU-only load — safe with bitsandbytes, stays within 16 GB RAM budget
             load_kwargs: Dict = {
                 "device_map": "cpu",
-                "torch_dtype": torch.bfloat16,
+                "torch_dtype": torch.float16,
                 "low_cpu_mem_usage": True,
                 "attn_implementation": "flash_attention_2",
             }
@@ -253,7 +253,7 @@ class ShardedModel:
             vram_limit_gb = float(os.environ.get("FITLLM_VRAM_LIMIT_GB", "4.0"))
             load_kwargs = {
                 "device_map": "auto",
-                "torch_dtype": torch.bfloat16,
+                "torch_dtype": torch.float16,
                 "low_cpu_mem_usage": True,
                 "attn_implementation": "flash_attention_2",
             }
