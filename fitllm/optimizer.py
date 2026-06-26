@@ -282,7 +282,7 @@ class ShardOptimizer:
         return {
             "global_step": self.global_step,
             "lora_opt_state": {
-                k: {ik: iv.cpu() for ik, iv in v.items() if isinstance(iv, torch.Tensor)}
+                k: {ik: (iv.cpu() if isinstance(iv, torch.Tensor) else iv) for ik, iv in v.items()}
                 for k, v in self._lora_opt_state.items()
             },
             "lr": self.lr,
@@ -296,6 +296,9 @@ class ShardOptimizer:
             self._lora_opt_state[k] = {
                 ik: iv for ik, iv in v.items()
             }
+            # 't' was missing in checkpoints saved before this fix — default to global_step
+            if "t" not in self._lora_opt_state[k]:
+                self._lora_opt_state[k]["t"] = self.global_step
 
     def zero_grad(self) -> None:
         """Zero gradients: delete disk grad files and zero in-memory grads."""
