@@ -150,12 +150,13 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     trainer = LoRATrainer(model, train_config)
 
+    start_step, start_sample = 0, 0
     if args.resume:
-        step, sample_index = trainer.resume_from_checkpoint(args.resume)
-        print(f"Resumed from step {step}, sample {sample_index}")
+        start_step, start_sample = trainer.resume_from_checkpoint(args.resume)
+        print(f"Resumed from step {start_step}, sample {start_sample}")
 
     print("Starting training ...")
-    trainer.train(dataset)
+    trainer.train(dataset, start_step=start_step, start_sample=start_sample)
 
 
 def cmd_probe(args: argparse.Namespace) -> None:

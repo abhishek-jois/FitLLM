@@ -359,13 +359,15 @@ class LoRATrainer:
         else:
             self._wandb = None
 
-    def train(self, dataset) -> None:
+    def train(self, dataset, start_step: int = 0, start_sample: int = 0) -> None:
         """
         Main training loop.
 
         Args:
             dataset: A HuggingFace dataset or iterable of dicts with
                      'input_ids' and optionally 'attention_mask'.
+            start_step: Resume global_step from this value (for LR schedule continuity).
+            start_sample: Number of samples already consumed; fast-forwards the iterator.
         """
         tokenizer = self.model.tokenizer
         config = self.config
@@ -416,8 +418,21 @@ class LoRATrainer:
         )
 
         data_iter = iter(dataloader)
-        global_step = 0
-        total_samples_seen = 0
+        global_step = start_step
+        total_samples_seen = start_sample
+
+        # Fast-forward past already-seen samples so we don't repeat training data.
+        # The dataloader is shuffled so exact order differs, but position in the
+        # epoch is preserved — avoids reusing the first N samples from the new shuffle.
+        if start_sample > 0:
+            skip = start_sample % len(dataset)
+            logger.info(f"Fast-forwarding data iterator by {skip} samples (epoch position)")
+            for _ in range(skip):
+                try:
+                    next(data_iter)
+                except StopIteration:
+                    data_iter = iter(dataloader)
+
         accum_loss = 0.0
         accum_count = 0
 
@@ -442,7 +457,7 @@ class LoRATrainer:
               f"{'Tok/s':>7}  {'Elapsed':>8}  {'ETA':>8}")
         print("-" * 84)
 
-        pbar = tqdm(total=config.max_steps, desc="Training", leave=False)
+        pbar = tqdm(total=config.max_steps, initial=start_step, desc="Training", leave=False)
 
         # Enable dynamic weight cache — sizes itself to available RAM automatically.
         # user_cap_gb=0 means "use all available RAM minus safety margin".
