@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from .probe import AdaptiveShardProbe
 from .scheduler import ShardScheduler
-from .forward import _get_decoder_layers, _restore_bnb_quant_state
+from .forward import _get_decoder_layers, _restore_bnb_quant_state, _safe_layer_to_cpu
 
 if TYPE_CHECKING:
     from .model import ShardedModel
@@ -116,7 +116,7 @@ class BackwardEngine:
                         output = layer(h_prev)
                     except Exception as e:
                         logger.warning(f"Layer {layer_idx} forward failed in backward: {e}")
-                        layer.cpu()
+                        _safe_layer_to_cpu(layer, layer_idx)
                         self.scheduler.evict_layer_from_gpu(layer_idx)
                         del layer
                         continue
@@ -141,7 +141,7 @@ class BackwardEngine:
             # Move layer back to CPU — _reconstruct_layer returns a ref to the
             # actual hf_model decoder layer (not a copy), so del alone doesn't
             # free GPU VRAM (hf_model keeps the reference alive).
-            layer.cpu()
+            _safe_layer_to_cpu(layer, layer_idx)
             # Done with this layer's GPU copy — free VRAM for next layer
             self.scheduler.evict_layer_from_gpu(layer_idx)
             del layer
@@ -243,7 +243,7 @@ class BackwardEngine:
 
             # Move layer back to CPU before evicting (same reason as in forward:
             # _reconstruct_layer returns a hf_model ref, del alone doesn't free GPU).
-            layer.cpu()
+            _safe_layer_to_cpu(layer, layer_idx)
             # Free GPU memory — CPU weight cache keeps shard until clear_weight_cache()
             self.scheduler.evict_layer_from_gpu(layer_idx)
             del layer
@@ -254,11 +254,18 @@ class BackwardEngine:
         """Reconstruct a layer from shard tensors.
         Uses cached _decoder_layers list to avoid repeated HF model tree traversal.
         """
+        # Strip LoRA keys before applying the shard. Shards were saved from the
+        # PEFT model and contain the initial lora_A/lora_B values. Applying them
+        # would reset trained LoRA weights back to initialization on every layer
+        # load, silently discarding all optimizer updates and making loss flat.
+        base_tensors = {k: v for k, v in tensors.items()
+                        if "lora_A" not in k and "lora_B" not in k}
+
         # Fast path: cached layer list
         cached_layers = getattr(self.model_ref, "_decoder_layers", None)
         if cached_layers is not None and layer_idx < len(cached_layers):
             layer = cached_layers[layer_idx]
-            layer.load_state_dict(tensors, strict=False)
+            layer.load_state_dict(base_tensors, strict=False)
             _restore_bnb_quant_state(layer, tensors)
             return layer
 
@@ -273,7 +280,7 @@ class BackwardEngine:
         if layers is None or layer_idx >= len(layers):
             raise RuntimeError(f"Cannot find layer {layer_idx}")
         layer = layers[layer_idx]
-        layer.load_state_dict(tensors, strict=False)
+        layer.load_state_dict(base_tensors, strict=False)
         _restore_bnb_quant_state(layer, tensors)
         return layer
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures as _cf
 import logging
+import os
+import threading
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -17,6 +19,58 @@ if TYPE_CHECKING:
     from .model import ShardedModel
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_layer_to_cpu(layer: "nn.Module", layer_idx: int, timeout: float = 60.0) -> None:
+    """Move a decoder layer to CPU with a deadlock watchdog.
+
+    layer.cpu() requires a CUDA→CPU DMA transfer. Under extreme VRAM pressure
+    (other tenants filling the GPU) the CUDA driver can deadlock — the call
+    blocks indefinitely and the training loop freezes silently for hours.
+
+    This function runs layer.cpu() in a daemon thread and waits at most
+    `timeout` seconds. If the transfer completes normally: return. If it hangs,
+    we log diagnostics and call os._exit(1) so the process terminates immediately
+    (bypassing any further CUDA calls that would also deadlock). The external
+    watchdog script (watchdog.sh) detects the exit and resumes from the last
+    saved checkpoint automatically.
+    """
+    done = threading.Event()
+    exc: list = []
+
+    def _move() -> None:
+        try:
+            layer.cpu()
+        except Exception as e:
+            exc.append(e)
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_move, daemon=True)
+    t.start()
+
+    if done.wait(timeout=timeout):
+        if exc:
+            logger.error(f"layer.cpu() for layer {layer_idx} raised: {exc[0]}")
+        return
+
+    # Timeout — CUDA is deadlocked. Log everything useful, then terminate.
+    vram_msg = ""
+    try:
+        alloc = torch.cuda.memory_allocated() / 1024 ** 3
+        reserved = torch.cuda.memory_reserved() / 1024 ** 3
+        vram_msg = f" VRAM: {alloc:.2f}GB allocated / {reserved:.2f}GB reserved."
+    except Exception:
+        pass
+
+    logger.critical(
+        f"DEADLOCK: layer.cpu() for layer {layer_idx} hung for {timeout:.0f}s."
+        f"{vram_msg} Terminating process — watchdog will resume from last checkpoint."
+    )
+    # os._exit skips Python atexit/finalizers (which would also block on CUDA)
+    # and immediately terminates. The watchdog script detects the exit code and
+    # restarts training from the most recent checkpoint.
+    os._exit(1)
 
 
 def _restore_bnb_quant_state(layer: nn.Module, tensors: dict) -> None:
@@ -467,7 +521,7 @@ class ForwardEngine:
             # hf_model decoder layer (not a copy), so del layer alone only
             # drops the local ref — the hf_model still holds the object and
             # its GPU tensors would remain, accumulating ~0.23 GB per layer.
-            layer.cpu()
+            _safe_layer_to_cpu(layer, layer_idx)
             # Evict from GPU cache — frees VRAM for next layer load.
             # CPU weight cache keeps the shard for the backward phase.
             self.scheduler.evict_layer_from_gpu(layer_idx)
@@ -672,11 +726,18 @@ class ForwardEngine:
         """Reconstruct a runnable nn.Module from a flat dict of tensors.
         Uses cached _decoder_layers list to avoid repeated HF model tree traversal.
         """
+        # Strip LoRA keys before applying the shard. Shards were saved from the
+        # PEFT model and contain the initial lora_A/lora_B values. Applying them
+        # would reset trained LoRA weights back to initialization on every layer
+        # load, silently discarding all optimizer updates and making loss flat.
+        base_tensors = {k: v for k, v in tensors.items()
+                        if "lora_A" not in k and "lora_B" not in k}
+
         # Fast path: use cached layer list (set on ShardedModel after init)
         cached_layers = getattr(self.model_ref, "_decoder_layers", None)
         if cached_layers is not None and layer_idx < len(cached_layers):
             layer = cached_layers[layer_idx]
-            missing, _ = layer.load_state_dict(tensors, strict=False)
+            missing, _ = layer.load_state_dict(base_tensors, strict=False)
             if missing:
                 logger.debug(f"Layer {layer_idx}: {len(missing)} missing keys in shard")
             _restore_bnb_quant_state(layer, tensors)
@@ -692,7 +753,7 @@ class ForwardEngine:
                 layers = _get_decoder_layers(model, model_type)
             if layers is not None and layer_idx < len(layers):
                 layer = layers[layer_idx]
-                layer.load_state_dict(tensors, strict=False)
+                layer.load_state_dict(base_tensors, strict=False)
                 _restore_bnb_quant_state(layer, tensors)
                 return layer
 
