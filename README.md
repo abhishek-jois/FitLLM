@@ -198,7 +198,7 @@ For a 32B model in 4-bit: 64 files × ~242 MB = ~15.5 GB on disk.
 python -m fitllm train \
   --shard-dir ./shards-qwen32b \
   --dataset databricks/databricks-dolly-15k \
-  --steps 1000
+  --steps 9380
 ```
 
 What healthy training looks like:
@@ -206,19 +206,20 @@ What healthy training looks like:
 ```
 ===================================================================================
   FitLLM Training  |  Qwen/Qwen2.5-32B-Instruct  |  4-bit NF4  |  LoRA r=16
-  steps=1000  grad_accum=8  lr=2e-4  seq_len=512  warmup=50
+  steps=9380  grad_accum=16  lr=1e-4  seq_len=512  warmup=50
 ===================================================================================
     Step    Loss   Smooth  GradNorm       LR   Tok/s   Elapsed      ETA
 -----------------------------------------------------------------------------------
-       1/1000  2.4132  2.4132    0.8821  2.0e-06    14.2   0:01:28  24:38:00
-      10/1000  2.1847  2.2934    0.7103  2.0e-05    16.8   0:14:22  23:49:00
-      50/1000  1.9203  2.0118    0.6244  2.0e-04    18.1   1:12:05  22:16:00
-     100/1000  1.7441  1.8392    0.5902  1.9e-04    18.4   2:27:12  21:03:00
+       1/9380  2.4132  2.4132    0.8821  2.0e-06    14.2   0:01:28  
+      10/9380  2.1847  2.2934    0.7103  2.0e-05    16.8   0:14:22  
+      50/9380  1.9203  2.0118    0.6244  1.0e-04    18.1   1:12:05  
+     100/9380  1.7441  1.8392    0.5902  9.8e-05    18.4   2:27:12  
 ```
 
 Log lines to watch for:
 - `[Waiting on GPU VRAM (other tenants busy)]` — normal, will self-resolve in seconds
 - `[GPU VRAM contention persisted for 120s]` — concerning; GPU heavily saturated
+- `DEADLOCK: layer.cpu() hung` — process will self-terminate; watchdog auto-restarts it
 - Loss decreasing steadily after warmup (step 50) — training is healthy
 
 ### 5. Generate
@@ -336,10 +337,17 @@ All values can be set in `.env` or as environment variables. CLI flags override 
 | Model | Qwen/Qwen2.5-32B-Instruct |
 | Dataset | databricks/databricks-dolly-15k (15,011 examples) |
 | Target | 9,380 steps = 10 epochs |
+| Progress | Step ~3,900 / 9,380 (resuming after bug fix) |
 | VRAM budget | **4.0 GB** (self-imposed, enforced live) |
-| LoRA | rank=16, targets: `q_proj` + `v_proj` |
+| LoRA | rank=16, alpha=32, targets: `q_proj` + `v_proj` |
 | Trainable params | ~25M out of 32B (0.08%) |
+| LR | 1e-4 with cosine decay, 50-step linear warmup |
+| Grad accumulation | 16 steps |
 | Hardware | A100 80 GB shared with other tenants |
+
+**Bug fixes landed in this run:**
+- **LoRA weight reset** — shard files baked in initial lora_A/lora_B values; every layer load was resetting trained weights to initialization, making loss flat for the first 3,900 steps. Fixed: LoRA keys are now stripped from shard tensors before `load_state_dict`.
+- **CUDA deadlock** — `layer.cpu()` can hang indefinitely under GPU memory pressure from co-tenants. Fixed: 60-second timeout + `os._exit(1)` so the process terminates instead of freezing; `watchdog.sh` auto-restarts from the latest checkpoint.
 
 ---
 
@@ -361,30 +369,41 @@ All values can be set in `.env` or as environment variables. CLI flags override 
 
 ## Long Runs
 
-For multi-hour or multi-day training, use `tmux` so the session survives disconnects:
+### Recommended: watchdog + tmux
+
+`watchdog.sh` monitors the training log and auto-restarts from the latest checkpoint if the process freezes or crashes (e.g., CUDA deadlock from co-tenant GPU pressure). Run it inside `tmux` so both survive disconnects:
 
 ```bash
 tmux new -s fitllm_train
 source /data/fitllm-venv/bin/activate
 
-python -m fitllm train \
-  --shard-dir ./shards-qwen32b \
-  --dataset databricks/databricks-dolly-15k \
-  --steps 9380 \
-  2>&1 | tee training_$(date +%Y%m%d_%H%M%S).log
-
-# Detach:   Ctrl+B, D
-# Reattach: tmux attach -t fitllm_train
+# The watchdog starts training itself and restarts it on any crash.
+# It finds the latest checkpoint automatically — no manual --resume needed.
+./watchdog.sh
 ```
 
-Resume from a checkpoint after any interruption:
+The watchdog:
+- Starts training via `nohup python -m fitllm train ...`
+- Polls the log file every 30 seconds
+- Kills and restarts training if the log goes silent for >5 minutes (one step is ~88s)
+- Waits 15 seconds after a kill to let GPU memory clear before restarting
+
+```bash
+# Detach:   Ctrl+B, D
+# Reattach: tmux attach -t fitllm_train
+# Stop watchdog: kill <watchdog_pid>
+```
+
+### Manual resume
+
+Resume from a specific checkpoint after any interruption:
 
 ```bash
 python -m fitllm train \
   --shard-dir ./shards-qwen32b \
   --dataset databricks/databricks-dolly-15k \
   --steps 9380 \
-  --resume ./checkpoints-qwen32b/step_1200
+  --resume ./checkpoints-qwen32b/checkpoint_step_003900.pt
 ```
 
 ---
